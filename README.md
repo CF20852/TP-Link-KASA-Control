@@ -21,6 +21,6 @@ Here are some brief (very brief) descriptions of what the Python programs in thi
 - kasa_xor_scan.py scans an entire subnet for kasa devices that use the XOR encryption protocol and returns their IP addresses and device info.
 - kasa_xor_test.py interrogates a single Kasa device that uses the XOR encryption protocol and returns its device info.
 - kasa_xor_control.py allows the user to turn a single Kasa device that uses the XOR encryption protocol on and off.
-- kasa_klap_control.py allows the user to turn a single Kasa device that uses the KLAP v2 encryption protocol on and off
+- kasa_klap_control.py allows the user to turn a single Kasa device that uses the KLAP v2 encryption protocol on and off.  Requires the Kasa username and password of the owner of the device.
 
 To discover devices that use the KLAP encryption protocol, use the python-kasa library's `kasa discover` command.
