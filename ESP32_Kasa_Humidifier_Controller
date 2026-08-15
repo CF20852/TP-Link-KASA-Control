@@ -1,0 +1,523 @@
+/*
+ * ESP32-DevKitC Humidity Controller with TP-Link Kasa HS103 Smart Plug
+ * -------------------------------------------------------------------
+ * - Reads a DHT22 (AM2302) on GPIO 4 every 20 seconds.
+ * - Hosts a web page (via ESPAsyncWebServer) showing temperature,
+ *   humidity, and plug status.
+ * - Lets the user set low/high humidity thresholds (defaults 30% / 40% RH)
+ *   and the IP address of a Kasa smart plug.
+ * - Turns the plug ON when RH < low threshold and OFF when RH > high
+ *   threshold (hysteresis band in between = no change).
+ * - Talks to the smart plug over TCP port 9999 using the Kasa "autokey" XOR
+ *   encryption scheme (initial key 171), with a 4-byte big-endian length
+ *   header, which is what the smart plug expects on port 9999.
+ * - Connects to Wi-Fi with a fixed (static) IP address and automatically
+ *   restarts the Wi-Fi connection if it drops.
+ * - Debug logging for Wi-Fi setup, DHT22 setup, and smart-plug
+ *   communication can be compiled in or out with the DEBUG_ENABLED
+ *   #define below (comment it out to remove debug output entirely).
+ *
+ * Libraries required (install via Arduino IDE Library Manager):
+ *   - "DHT sensor library" by Adafruit (and its dependency
+ *     "Adafruit Unified Sensor")
+ *   - "ESPAsyncWebServer" (ESP32Async/ESPAsyncWebServer — the maintained
+ *     fork; search "ESPAsyncWebServer" in Library Manager)
+ *   - "AsyncTCP" (ESP32Async/AsyncTCP — dependency of the above, for ESP32)
+ * WiFi.h, WiFiClient.h, and Preferences.h ship with the ESP32 Arduino core.
+ *
+ * Wiring (DHT22):
+ *   VCC  -> 3.3V
+ *   DATA -> GPIO 4   (with a 10k pull-up resistor from DATA to 3.3V)
+ *   GND  -> GND
+ */
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <Preferences.h>
+#include <DHT.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+// ---------------------- User configuration ----------------------
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// Fixed (static) IP configuration for this device.
+// Adjust these four addresses to match your network. LOCAL_IP must be
+// outside your router's DHCP pool (or reserved for this device) to avoid
+// conflicting with another device.
+IPAddress LOCAL_IP     (YOUR_ESP32_IP_ADDR);  // the fixed address this ESP32 will use
+IPAddress GATEWAY_IP   (YOUR_ROUTER_ADDRESS);    // your router's address
+IPAddress SUBNET_MASK  (YOUR_ROUTER_SUBNET_MASK);
+IPAddress PRIMARY_DNS  (YOUR_ROUTER_DNS_ADDRESS);    // usually the router; change if you use a different DNS
+IPAddress SECONDARY_DNS(8, 8, 8, 8);        // fallback DNS
+
+// Wi-Fi supervision: how often to check the connection and, if needed,
+// restart it.
+const unsigned long WIFI_CHECK_INTERVAL_MS = 5000UL;
+
+#define DHTPIN   4
+#define DHTTYPE  DHT22
+
+const unsigned long SENSOR_INTERVAL_MS = 20000UL;  // read DHT22 every 20 s
+const uint16_t      KASA_PORT          = 9999;     // HS103 local API port
+
+// ---------------------- Debug output ----------------------
+// Comment out the line below to compile out all debug output (the
+// DEBUG_PRINT* calls then expand to nothing and cost no flash/time).
+#define DEBUG_ENABLED
+
+#ifdef DEBUG_ENABLED
+  #define DEBUG_PRINT(x)     Serial.print(x)
+  #define DEBUG_PRINTLN(x)   Serial.println(x)
+  #define DEBUG_PRINTF(...)  Serial.printf(__VA_ARGS__)
+#else
+  #define DEBUG_PRINT(x)
+  #define DEBUG_PRINTLN(x)
+  #define DEBUG_PRINTF(...)
+#endif
+
+// ---------------------- Globals ----------------------
+DHT             dht(DHTPIN, DHTTYPE);
+AsyncWebServer  server(80);
+Preferences     prefs;
+
+float  temperatureC   = NAN;
+float  temperatureF   = NAN;
+float  humidity       = NAN;
+bool   sensorOK       = false;
+
+float  lowThreshold   = 30.0;   // default low threshold, % RH
+float  highThreshold  = 40.0;   // default high threshold, % RH
+String plugIP         = "";     // Kasa HS103 IP address (user-supplied)
+
+// Plug state tracking: -1 = unknown, 0 = off, 1 = on
+int    plugState      = -1;
+bool   plugReachable  = false;
+
+unsigned long lastSensorRead = 0;
+unsigned long lastWifiCheck  = 0;
+
+// ---------------------- Kasa XOR "autokey" encryption ----------------------
+// Encrypt: key starts at 171; each ciphertext byte = plaintext ^ key,
+// and the ciphertext byte becomes the key for the next byte.
+void kasaEncrypt(const String& plain, uint8_t* out) {
+  uint8_t key = 171;
+  for (size_t i = 0; i < plain.length(); i++) {
+    key = key ^ (uint8_t)plain[i];
+    out[i] = key;
+  }
+}
+
+// Decrypt: key starts at 171; plaintext byte = ciphertext ^ key,
+// and the ciphertext byte becomes the key for the next byte.
+String kasaDecrypt(const uint8_t* data, size_t len) {
+  uint8_t key = 171;
+  String result;
+  result.reserve(len);
+  for (size_t i = 0; i < len; i++) {
+    result += (char)(data[i] ^ key);
+    key = data[i];
+  }
+  return result;
+}
+
+// Send a JSON command to the plug over TCP 9999 and return the decrypted
+// JSON reply ("" on failure). Port-9999 messages are framed with a 4-byte
+// big-endian length prefix. This uses the plain (synchronous) WiFiClient,
+// which is fine here since it's called from loop()/form handlers, not
+// from inside an async request callback.
+String kasaSendCommand(const String& jsonCmd) {
+  if (plugIP.length() == 0) return "";
+
+  DEBUG_PRINT("[Kasa] Connecting to plug at ");
+  DEBUG_PRINT(plugIP);
+  DEBUG_PRINT(":");
+  DEBUG_PRINTLN(KASA_PORT);
+
+  WiFiClient client;
+  if (!client.connect(plugIP.c_str(), KASA_PORT, 2000)) {
+    DEBUG_PRINTLN("[Kasa] Connection to plug failed");
+    return "";
+  }
+  DEBUG_PRINTLN("[Kasa] Connected. Sending command...");
+  DEBUG_PRINT("[Kasa] Command JSON: ");
+  DEBUG_PRINTLN(jsonCmd);
+
+  size_t len = jsonCmd.length();
+  uint8_t header[4] = {
+    (uint8_t)((len >> 24) & 0xFF),
+    (uint8_t)((len >> 16) & 0xFF),
+    (uint8_t)((len >> 8)  & 0xFF),
+    (uint8_t)( len        & 0xFF)
+  };
+
+  uint8_t* payload = (uint8_t*)malloc(len);
+  if (!payload) { client.stop(); return ""; }
+  kasaEncrypt(jsonCmd, payload);
+
+  client.write(header, 4);
+  client.write(payload, len);
+  free(payload);
+
+  // Read the 4-byte length header of the reply
+  unsigned long start = millis();
+  while (client.available() < 4) {
+    if (millis() - start > 2000 || !client.connected()) { client.stop(); return ""; }
+    delay(10);
+  }
+  uint8_t rh[4];
+  client.readBytes(rh, 4);
+  uint32_t respLen = ((uint32_t)rh[0] << 24) | ((uint32_t)rh[1] << 16) |
+                     ((uint32_t)rh[2] << 8)  |  (uint32_t)rh[3];
+  if (respLen == 0 || respLen > 4096) { client.stop(); return ""; }
+
+  uint8_t* resp = (uint8_t*)malloc(respLen);
+  if (!resp) { client.stop(); return ""; }
+
+  size_t got = 0;
+  start = millis();
+  while (got < respLen) {
+    if (millis() - start > 3000 || (!client.connected() && !client.available())) break;
+    int avail = client.available();
+    if (avail > 0) {
+      size_t toRead = (size_t)respLen - got;
+      if ((size_t)avail < toRead) toRead = (size_t)avail;
+      got += client.readBytes(resp + got, toRead);
+    } else {
+      delay(10);
+    }
+  }
+  client.stop();
+
+  String decoded = (got == respLen) ? kasaDecrypt(resp, respLen) : "";
+  free(resp);
+
+  DEBUG_PRINT("[Kasa] Reply received: ");
+  DEBUG_PRINTLN(decoded.length() > 0 ? decoded : "(none / timeout)");
+
+  return decoded;
+}
+
+// Set relay: state = 1 (on) or 0 (off). Returns true on success.
+bool kasaSetRelay(int state) {
+  DEBUG_PRINT("[Kasa] Setting relay state to ");
+  DEBUG_PRINTLN(state == 1 ? "ON" : "OFF");
+
+  String cmd = String("{\"system\":{\"set_relay_state\":{\"state\":") + state + "}}}";
+  String reply = kasaSendCommand(cmd);
+  bool ok = (reply.indexOf("\"err_code\":0") >= 0);
+  plugReachable = (reply.length() > 0);
+  if (ok) plugState = state;
+
+  DEBUG_PRINTLN(ok ? "[Kasa] Relay command succeeded" : "[Kasa] Relay command failed");
+  return ok;
+}
+
+// Query the plug and update plugState from its sysinfo.
+void kasaQueryState() {
+  DEBUG_PRINTLN("[Kasa] Querying plug status (get_sysinfo)...");
+
+  String reply = kasaSendCommand("{\"system\":{\"get_sysinfo\":{}}}");
+  plugReachable = (reply.length() > 0);
+  if (!plugReachable) {
+    DEBUG_PRINTLN("[Kasa] Plug unreachable");
+    plugState = -1;
+    return;
+  }
+  int idx = reply.indexOf("\"relay_state\":");
+  if (idx >= 0) {
+    char c = reply.charAt(idx + 14);
+    if (c == '0') plugState = 0;
+    else if (c == '1') plugState = 1;
+  }
+  DEBUG_PRINT("[Kasa] Plug state is now: ");
+  DEBUG_PRINTLN(plugState == 1 ? "ON" : (plugState == 0 ? "OFF" : "Unknown"));
+}
+
+// ---------------------- Control logic ----------------------
+void applyHumidityControl() {
+  if (!sensorOK || plugIP.length() == 0) return;
+
+  if (humidity < lowThreshold) {
+    if (plugState != 1) kasaSetRelay(1);   // too dry -> plug ON
+  } else if (humidity > highThreshold) {
+    if (plugState != 0) kasaSetRelay(0);   // humid enough -> plug OFF
+  }
+  // Between thresholds: leave the plug as-is (hysteresis).
+}
+
+// ---------------------- Persistence ----------------------
+void loadSettings() {
+  prefs.begin("humctl", true);
+  lowThreshold  = prefs.getFloat("low", 30.0);
+  highThreshold = prefs.getFloat("high", 40.0);
+  plugIP        = prefs.getString("plugip", "");
+  prefs.end();
+}
+
+void saveSettings() {
+  prefs.begin("humctl", false);
+  prefs.putFloat("low", lowThreshold);
+  prefs.putFloat("high", highThreshold);
+  prefs.putString("plugip", plugIP);
+  prefs.end();
+}
+
+// ---------------------- Web interface ----------------------
+const char PAGE_TEMPLATE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Debi's Humidifier Controller</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; background:#f2f4f7; margin:0; padding:20px; color:#222; }
+  .card { background:#fff; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,0.15);
+          max-width:480px; margin:0 auto 16px auto; padding:20px; }
+  h1 { font-size:1.3em; margin:0 auto 16px auto; max-width:480px; }
+  .reading { font-size:2em; font-weight:bold; }
+  .label { color:#666; font-size:0.9em; }
+  .row { margin-bottom:12px; }
+  input[type=text], input[type=number] { width:100%; box-sizing:border-box; padding:8px;
+          border:1px solid #ccc; border-radius:4px; font-size:1em; }
+  input[type=submit] { background:#1a73e8; color:#fff; border:none; padding:10px 18px;
+          border-radius:4px; font-size:1em; cursor:pointer; }
+  input[type=submit]:hover { background:#1558b0; }
+  .status-on  { color:#188038; font-weight:bold; }
+  .status-off { color:#b00020; font-weight:bold; }
+  .status-unk { color:#888; font-weight:bold; }
+  .err { color:#b00020; }
+</style>
+</head>
+<body>
+<h1>Debi's Humidifier Controller</h1>
+
+<div class="card">
+  <div class="row">
+    <div class="label">Temperature</div>
+    <div class="reading"><span id="temp">--</span> &deg;F</div>
+  </div>
+  <div class="row">
+    <div class="label">Relative Humidity</div>
+    <div class="reading"><span id="hum">--</span> %</div>
+  </div>
+  <div class="row">
+    <div class="label">Smart Plug Status</div>
+    <div class="reading"><span id="plug" class="status-unk">Unknown</span></div>
+  </div>
+  <div class="label">Readings update every 20 seconds. Plug turns ON below the low threshold and OFF above the high threshold.</div>
+</div>
+
+<div class="card">
+  <form action="/save" method="POST">
+    <div class="row">
+      <div class="label">Low humidity threshold (%RH) &mdash; plug turns ON below this</div>
+      <input type="number" name="low" step="0.1" min="0" max="100" value="%LOW%">
+    </div>
+    <div class="row">
+      <div class="label">High humidity threshold (%RH) &mdash; plug turns OFF above this</div>
+      <input type="number" name="high" step="0.1" min="0" max="100" value="%HIGH%">
+    </div>
+    <div class="row">
+      <div class="label">Kasa HS103 smart plug IP address (e.g. 192.168.4.62)</div>
+      <input type="text" name="plugip" value="%PLUGIP%" placeholder="192.168.4.62">
+    </div>
+    <input type="submit" value="Save settings">
+    <div class="err">%MSG%</div>
+  </form>
+</div>
+
+<script>
+function refresh() {
+  fetch('/data').then(r => r.json()).then(d => {
+    document.getElementById('temp').textContent = d.tempValid ? d.temp.toFixed(1) : '--';
+    document.getElementById('hum').textContent  = d.tempValid ? d.hum.toFixed(1)  : '--';
+    var p = document.getElementById('plug');
+    if (d.plugState === 1)      { p.textContent = 'ON';          p.className = 'status-on';  }
+    else if (d.plugState === 0) { p.textContent = 'OFF';         p.className = 'status-off'; }
+    else                        { p.textContent = 'Unknown / unreachable'; p.className = 'status-unk'; }
+  }).catch(() => {});
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+String buildPage(const String& msg) {
+  String page = FPSTR(PAGE_TEMPLATE);
+  page.replace("%LOW%",    String(lowThreshold, 1));
+  page.replace("%HIGH%",   String(highThreshold, 1));
+  page.replace("%PLUGIP%", plugIP);
+  page.replace("%MSG%",    msg);
+  return page;
+}
+
+// Basic validation of a dotted-quad IPv4 string.
+bool isValidIP(const String& s) {
+  if (s.length() == 0) return true;  // empty = "no plug configured" is allowed
+  IPAddress ip;
+  return ip.fromString(s);
+}
+
+void setupWebServer() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(200, "text/html", buildPage(""));
+  });
+
+  server.on("/data", HTTP_GET, [](AsyncWebServerRequest* request) {
+    String json = "{";
+    json += "\"tempValid\":" + String(sensorOK ? "true" : "false") + ",";
+    json += "\"temp\":"      + String(sensorOK ? temperatureF : 0.0, 1) + ",";
+    json += "\"hum\":"       + String(sensorOK ? humidity : 0.0, 1) + ",";
+    json += "\"plugState\":" + String(plugState);
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  server.on("/save", HTTP_POST, [](AsyncWebServerRequest* request) {
+    String msg = "";
+
+    float newLow  = request->hasParam("low",  true) ? request->getParam("low",  true)->value().toFloat() : lowThreshold;
+    float newHigh = request->hasParam("high", true) ? request->getParam("high", true)->value().toFloat() : highThreshold;
+    String newIP  = request->hasParam("plugip", true) ? request->getParam("plugip", true)->value() : plugIP;
+    newIP.trim();
+
+    if (newLow < 0 || newLow > 100 || newHigh < 0 || newHigh > 100) {
+      msg = "Thresholds must be between 0 and 100 %RH. Settings not saved.";
+    } else if (newLow >= newHigh) {
+      msg = "The low threshold must be less than the high threshold. Settings not saved.";
+    } else if (!isValidIP(newIP)) {
+      msg = "Invalid plug IP address. Settings not saved.";
+    } else {
+      lowThreshold  = newLow;
+      highThreshold = newHigh;
+      if (newIP != plugIP) {
+        plugIP = newIP;
+        plugState = -1;             // state unknown for the new plug
+        if (plugIP.length() > 0) kasaQueryState();
+      }
+      saveSettings();
+      applyHumidityControl();       // re-evaluate immediately with new settings
+      msg = "Settings saved.";
+    }
+
+    request->send(200, "text/html", buildPage(msg));
+  });
+
+  server.begin();
+}
+
+// ---------------------- Wi-Fi connection management ----------------------
+// Applies the fixed IP and (re)starts the connection. Used both at boot
+// and any time the connection needs to be restarted.
+void connectWiFi() {
+  DEBUG_PRINTLN("[WiFi] Starting Wi-Fi setup...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();  // clear any previous connection attempt/state first
+
+  DEBUG_PRINT("[WiFi] Static IP: ");     DEBUG_PRINTLN(LOCAL_IP);
+  DEBUG_PRINT("[WiFi] Gateway: ");       DEBUG_PRINTLN(GATEWAY_IP);
+  DEBUG_PRINT("[WiFi] Subnet mask: ");   DEBUG_PRINTLN(SUBNET_MASK);
+  DEBUG_PRINT("[WiFi] Primary DNS: ");   DEBUG_PRINTLN(PRIMARY_DNS);
+  DEBUG_PRINT("[WiFi] Secondary DNS: "); DEBUG_PRINTLN(SECONDARY_DNS);
+
+  if (!WiFi.config(LOCAL_IP, GATEWAY_IP, SUBNET_MASK, PRIMARY_DNS, SECONDARY_DNS)) {
+    Serial.println("Static IP configuration failed");
+  } else {
+    DEBUG_PRINTLN("[WiFi] Static IP configuration applied");
+  }
+
+  DEBUG_PRINT("[WiFi] Calling WiFi.begin() with SSID: ");
+  DEBUG_PRINTLN(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  lastWifiCheck = millis();
+}
+
+// ---------------------- Setup / Loop ----------------------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  loadSettings();
+
+  dht.begin();
+  DEBUG_PRINT("[DHT22] Sensor initialized on GPIO ");
+  DEBUG_PRINTLN(DHTPIN);
+
+  connectWiFi();
+  Serial.print("Connecting to WiFi");
+  unsigned long connectStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - connectStart < 15000UL) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Connected. Open http://");
+    Serial.println(WiFi.localIP());
+    DEBUG_PRINT("[WiFi] MAC address: ");
+    DEBUG_PRINTLN(WiFi.macAddress());
+    DEBUG_PRINT("[WiFi] Signal strength (RSSI): ");
+    DEBUG_PRINT(WiFi.RSSI());
+    DEBUG_PRINTLN(" dBm");
+  } else {
+    Serial.println("Not yet connected; will keep retrying in the background.");
+  }
+
+  setupWebServer();  // async server starts listening and runs in the background
+
+  DEBUG_PRINT("[Kasa] Configured plug IP: ");
+  DEBUG_PRINTLN(plugIP.length() > 0 ? plugIP : "(none set)");
+
+  if (plugIP.length() > 0) {
+    DEBUG_PRINTLN("[Kasa] Querying initial smart plug state...");
+    kasaQueryState();
+  } else {
+    DEBUG_PRINTLN("[Kasa] No plug IP configured yet; skipping initial state query.");
+  }
+
+  // Force an immediate first sensor read in loop()
+  lastSensorRead = millis() - SENSOR_INTERVAL_MS;
+}
+
+void loop() {
+  // Check the Wi-Fi link periodically (non-blocking) and restart the
+  // connection if it has dropped. Note: with ESPAsyncWebServer there is
+  // no server.handleClient() to call — requests are handled via
+  // callbacks/interrupts in the background.
+  if (millis() - lastWifiCheck >= WIFI_CHECK_INTERVAL_MS) {
+    lastWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi is down — restarting connection...");
+      connectWiFi();
+    }
+  }
+
+  if (millis() - lastSensorRead >= SENSOR_INTERVAL_MS) {
+    lastSensorRead = millis();
+
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+    if (isnan(h) || isnan(t)) {
+      sensorOK = false;
+      Serial.println("DHT22 read failed");
+    } else {
+      sensorOK = true;
+      humidity = h;
+      temperatureC = t;
+      temperatureF = temperatureC * 1.8 + 32;
+      Serial.printf("T = %.1f C, RH = %.1f %%\n", t, h);
+      applyHumidityControl();
+    }
+
+    // Refresh the plug's actual state so the web page reflects reality
+    // (e.g. if someone toggled it with the physical button or the app).
+    if (plugIP.length() > 0) kasaQueryState();
+  }
+}
