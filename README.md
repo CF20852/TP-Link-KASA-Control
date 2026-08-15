@@ -1,6 +1,6 @@
 This repository contains several Python 3 programs that can be used to find and control TP-Link Kasa devices.  It also contains an ESP32 program that can be used to control a humidifier that doesn't have a built-in humidistat via a TP-Link Kasa smart plug.
 
-Another useful collection of Python Kasa discovery and control software can be found in the python-kasa repo.
+Another useful collection of Python Kasa discovery and control software can be found in the [Python-Kasa repo](https://github.com/python-kasa/python-kasa).
 
 TP-Link seems to have started with a simple XOR-based encryption technique where the first byte of a message is XOR'd with 0xAB and the remaining bytes of the message are XOR'd with the result XORing the bytes with the XOR'd previous byte.  TP-Link now uses a handshake/encryption protocol called KLAP.
 
