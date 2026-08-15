@@ -23,4 +23,6 @@ Here are some brief (very brief) descriptions of what the Python programs in thi
 - kasa_xor_control.py allows the user to turn a single Kasa device that uses the XOR encryption protocol on and off.
 - kasa_klap_control.py allows the user to turn a single Kasa device that uses the KLAP v2 encryption protocol on and off.  Requires the Kasa username and password of the owner of the device.
 
+- ESP32_Kasa_Humidifier_Controller is an ESP32 program for the Arduino IDE environment.  The system comprises a DHT22 temperature/humidity sensor, an ESP-32 DevkitC microcontroller, a TP-Link Kasa smart plug, and a dumb humidifier.  The microcontroller reads the temperature and humidity levels from the DHT22 and turns the smart plug on and off to raise/lower the relative humidity.
+
 To discover devices that use the KLAP encryption protocol, use the python-kasa library's `kasa discover` command.
